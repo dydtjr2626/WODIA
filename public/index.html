@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WODIA</title><link rel="icon" href="/logo.png">
+<script>document.documentElement.dataset.theme=localStorage.getItem("pds-theme")||(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")</script>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="app">
+  <nav class="rail">
+    <button data-view="calendar" data-tip="달력" class="on">▦</button>
+    <button data-view="list" data-tip="목록 · 검색">☰</button>
+    <button data-view="tags" data-tip="태그">#</button>
+    <button data-view="review" data-tip="회고">✎</button>
+    <button data-view="trash" data-tip="휴지통">🗑</button>
+    <span class="sp"></span>
+    <button data-act="kbhelp" data-tip="단축키">⌨</button>
+    <button data-act="settings" id="gear" title="설정">⚙</button>
+  </nav>
+  <aside class="side">
+    <h1><img class="logo" src="/logo.png" alt="WODIA"></h1>
+    <div id="mini"></div>
+    <h3>오늘 이벤트</h3>
+    <div id="sideToday"></div>
+    <h3 class="ddh">D-day <button class="ico plus" data-act="ddnew" title="D-day 추가">+</button></h3>
+    <div id="ddlist"></div>
+  </aside>
+  <main id="main"></main>
+  <aside class="panel" id="panel"></aside>
+  <footer class="banner" id="banner"></footer>
+</div>
+<div id="toast"></div>
+<script src="/holidays.js"></script>
+<script src="/exercises.js"></script>
+<script src="/exercise-how.js"></script>
+<script src="/exercise-media.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

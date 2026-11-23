@@ -1,0 +1,8 @@
+{
+  "name": "plan-do-see",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=22.5" },
+  "scripts": { "start": "node server.js" }
+}
