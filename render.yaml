@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: yong-wodia
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /api/meta
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
