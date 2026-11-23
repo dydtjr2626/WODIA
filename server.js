@@ -790,6 +790,17 @@ async function api(req, res, url) {
   throw new HttpError(404, '없는 주소입니다');
 }
 
+// 무료 호스팅은 재시작 때 DB 파일이 사라지므로, 비어 있으면 저장소의 시작 데이터(seed/pds-all.json)로 채운다.
+// 호스팅 설정에서 AUTO_SEED=1 일 때만 동작하고, 이미 데이터가 있으면 아무것도 하지 않는다.
+if (process.env.AUTO_SEED === '1') {
+  const seedFile = path.join(ROOT, 'seed', 'pds-all.json');
+  const empty = db.prepare('SELECT COUNT(*) c FROM tasks').get().c === 0 && db.prepare('SELECT COUNT(*) c FROM plans').get().c === 0;
+  if (empty && fs.existsSync(seedFile)) {
+    try { console.log('시작 데이터 불러옴:', JSON.stringify(importAll(JSON.parse(fs.readFileSync(seedFile, 'utf8'))))); }
+    catch (e) { console.error('시작 데이터 불러오기 실패:', e.message); }
+  }
+}
+
 const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.json': 'application/json', '.svg': 'image/svg+xml' };
 http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
