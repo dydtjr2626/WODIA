@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: yong-wodia-7
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /
+    envVars:
+      - key: COOKIE_SECURE
+        value: "1"
+      - key: NODE_VERSION
+        value: "24"
