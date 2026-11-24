@@ -1,6 +1,7 @@
-﻿node_modules/
+node_modules/
 data/
 .claude/
-*.png
-!public/*.png
-work - 6.txt
+CLAUDE.md
+마지막에-꼭-저장.txt
+/*.png
+캡처/3-*

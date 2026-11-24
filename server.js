@@ -1,17 +1,35 @@
-// Plan-Do-See 다이어리 서버 — 의존성 없음 (Node 22+ 내장 node:sqlite)
+// Plan-Do-See 다이어리 서버 v2 — 회원 가입·로그인·세션 + 사용자별 자료 분리
+// 외부 패키지는 bcryptjs(비밀번호 해시) 하나뿐. 나머지는 Node 22+ 내장 기능(node:sqlite, node:crypto).
 import http from 'node:http';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
+import bcrypt from 'bcryptjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT) || 3000;
-const DB_PATH = process.env.DB_PATH || path.join(ROOT, 'data', 'pds.db');
-fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+const DATA_DIR = process.env.DATA_DIR || path.join(ROOT, 'data');
+const LEGACY_DB = process.env.DB_PATH || path.join(DATA_DIR, 'pds.db'); // 6번 다이어리 DB (첫 가입자의 계정으로 이관)
+const USERS_DIR = path.join(DATA_DIR, 'users');
+fs.mkdirSync(USERS_DIR, { recursive: true });
 
-const db = new DatabaseSync(DB_PATH);
+// ───────── 계정 DB: 아이디·비밀번호 해시·세션만 저장 (다이어리 자료와 파일이 분리됨) ─────────
+const authDb = new DatabaseSync(path.join(DATA_DIR, 'auth.db'));
+authDb.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+authDb.exec(`
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS sessions (
+  token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL, expires_at INTEGER NOT NULL);`);
+
+// ───────── 사용자별 자료 DB: data/users/<id>.db — 요청마다 로그인한 사용자의 DB 하나만 열린다 ─────────
+let db; // 현재 요청을 보낸 사용자의 DB (api() 안에서 세션으로 확인한 뒤에만 지정됨)
+const handles = new Map();
+function initSchema() {
 db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;');
 db.exec(`
 CREATE TABLE IF NOT EXISTS plans (
@@ -79,6 +97,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS ddays (id INTEGER PRIMARY KEY AUTOINCREMENT,
 if (!db.prepare('PRAGMA table_info(ddays)').all().some((c) => c.name === 'task_id')) db.exec('ALTER TABLE ddays ADD COLUMN task_id INTEGER');
 // 휴지통: 삭제한 이벤트를 통째로 보관 (복구할 때 그대로 되살림)
 db.exec(`CREATE TABLE IF NOT EXISTS trash (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER, title TEXT NOT NULL, due_date TEXT NOT NULL, snapshot TEXT NOT NULL, deleted_at TEXT NOT NULL)`);
+}
 
 // ───────── 시간·날짜 규칙: 모두 Asia/Seoul(+09:00), 날짜 YYYY-MM-DD, 시각 ISO8601+09:00, 시간 단위는 분 ─────────
 const nowIso = () => new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 19) + '+09:00';
@@ -630,7 +649,14 @@ async function api(req, res, url) {
   const { pathname: p, searchParams: sp } = url, m = req.method, q = Object.fromEntries(sp);
   const body = ['POST', 'PUT'].includes(m) ? await readBody(req, p === '/api/import' ? 5_000_000 : p === '/api/day-note' || p === '/api/month-note' ? 1_000_000 : 100_000) : {};
   let r;
-  if (p === '/api/meta' && m === 'GET') return json(res, 200, { today: today(), notice: '지금은 로그인이 없어 링크를 아는 사람은 누구나 볼 수 있습니다. 남이 봐도 괜찮은 내용만 넣으세요.' });
+  // 다른 사이트에서 보낸 쓰기 요청 차단 (Origin 이 있으면 이 서버 주소와 같아야 함)
+  if (m !== 'GET' && req.headers.origin && new URL(req.headers.origin).host !== req.headers.host) throw new HttpError(403, '허용되지 않은 요청 출처입니다');
+  if (p.startsWith('/api/auth/')) return authApi(req, res, p, m, body);
+  // ── 여기부터는 로그인한 사용자만. 세션 쿠키로 사용자를 찾고, 그 사용자의 DB만 연다 (남의 자료에는 닿을 수 없음) ──
+  const sess = currentSession(req);
+  if (!sess) return json(res, 401, { error: '로그인이 필요합니다' });
+  db = userDb(sess.user.id);
+  if (p === '/api/meta' && m === 'GET') return json(res, 200, { today: today(), user: sess.user, notice: '로그인한 본인 계정의 자료만 보입니다.' });
   if (p === '/api/plans' && m === 'GET') {
     const plans = db.prepare('SELECT * FROM plans WHERE archived = 0 ORDER BY id').all();
     plans.forEach((pl) => { pl.revisions = db.prepare('SELECT * FROM plan_revisions WHERE plan_id = ? ORDER BY rev_no').all(pl.id); });
@@ -790,18 +816,137 @@ async function api(req, res, url) {
   throw new HttpError(404, '없는 주소입니다');
 }
 
-// 무료 호스팅은 재시작 때 DB 파일이 사라지므로, 비어 있으면 저장소의 시작 데이터(seed/pds-all.json)로 채운다.
-// 호스팅 설정에서 AUTO_SEED=1 일 때만 동작하고, 이미 데이터가 있으면 아무것도 하지 않는다.
-if (process.env.AUTO_SEED === '1') {
-  const seedFile = path.join(ROOT, 'seed', 'pds-all.json');
-  const empty = db.prepare('SELECT COUNT(*) c FROM tasks').get().c === 0 && db.prepare('SELECT COUNT(*) c FROM plans').get().c === 0;
-  if (empty && fs.existsSync(seedFile)) {
-    try { console.log('시작 데이터 불러옴:', JSON.stringify(importAll(JSON.parse(fs.readFileSync(seedFile, 'utf8'))))); }
-    catch (e) { console.error('시작 데이터 불러오기 실패:', e.message); }
+const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.json': 'application/json', '.svg': 'image/svg+xml' };
+// ───────── 사용자 DB 열기 ─────────
+// 계정마다 파일이 따로라서, 다른 계정의 자료는 쿼리로도 닿을 수 없다.
+// 새 계정은 번호(ID) 범위도 서로 겹치지 않게 시작한다 → 남의 이벤트 번호를 넣으면 '없음(404)'으로 거절된다.
+const AUTO_TABLES = ['tasks', 'runs', 'plan_revisions', 'workout_sets', 'checklist_items', 'ddays', 'trash'];
+const dbFile = (uid) => path.join(USERS_DIR, `${uid}.db`);
+function userDb(uid) {
+  let h = handles.get(uid);
+  if (!h) {
+    const isNew = !fs.existsSync(dbFile(uid));
+    h = new DatabaseSync(dbFile(uid));
+    db = h;
+    initSchema();
+    if (isNew) {
+      const offset = (uid - 1) * 1_000_000;
+      if (offset > 0) AUTO_TABLES.forEach((t) => db.prepare('INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)').run(t, offset));
+    }
+    handles.set(uid, h);
   }
+  return h;
+}
+// 6번 다이어리(data/pds.db)는 가장 먼저 가입한 계정이 이어받는다. 원본 파일은 그대로 둔다.
+function claimLegacy(uid) {
+  if (!fs.existsSync(LEGACY_DB) || fs.existsSync(dbFile(uid))) return false;
+  const src = new DatabaseSync(LEGACY_DB);
+  try { src.prepare('VACUUM INTO ?').run(dbFile(uid)); } finally { src.close(); }
+  return true;
 }
 
-const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.json': 'application/json', '.svg': 'image/svg+xml' };
+// ───────── 인증: 가입 · 로그인 · 로그아웃 · 세션 ─────────
+const SESSION_TTL_MS = 7 * 24 * 3600e3; // 세션 유효 기간: 발급 후 7일
+const COOKIE = 'sid';
+const sha256 = (s) => createHash('sha256').update(s).digest('hex');
+const BAD_LOGIN = '아이디 또는 비밀번호가 올바르지 않습니다'; // 아이디가 없을 때와 비밀번호가 틀렸을 때 같은 문구
+const DUMMY_HASH = bcrypt.hashSync(randomBytes(16).toString('hex'), 10); // 없는 아이디일 때 쓰는 가짜 해시 (서버를 켤 때마다 무작위로 만듦)
+const failures = new Map(); // 로그인 연속 실패 횟수 (아이디별)
+
+const cookieOf = (req, name) => {
+  const m = String(req.headers.cookie || '').split(/;\s*/).find((c) => c.startsWith(name + '='));
+  return m ? decodeURIComponent(m.slice(name.length + 1)) : '';
+};
+const isoKst = (ms) => new Date(ms + 9 * 3600e3).toISOString().slice(0, 19) + '+09:00';
+const secureCookie = (req) => process.env.COOKIE_SECURE === '1' || req.headers['x-forwarded-proto'] === 'https';
+const cookieHeader = (req, value, maxAgeSec) =>
+  `${COOKIE}=${value}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAgeSec}${secureCookie(req) ? '; Secure' : ''}`;
+
+function newSession(userId) {
+  const token = randomBytes(32).toString('base64url'); // 브라우저에는 이 값만, 서버에는 해시만 저장
+  const now = Date.now();
+  authDb.prepare('DELETE FROM sessions WHERE expires_at < ?').run(now);
+  authDb.prepare('INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?,?,?,?)').run(sha256(token), userId, isoKst(now), now + SESSION_TTL_MS);
+  return token;
+}
+function currentSession(req) {
+  const t = cookieOf(req, COOKIE);
+  if (!t) return null;
+  const s = authDb.prepare(`SELECT s.token_hash, s.expires_at, u.id, u.username FROM sessions s JOIN users u ON u.id = s.user_id
+    WHERE s.token_hash = ? AND s.expires_at > ?`).get(sha256(t), Date.now());
+  return s ? { hash: s.token_hash, expires_at: s.expires_at, user: { id: s.id, username: s.username } } : null;
+}
+const readCreds = (b) => {
+  const username = typeof b.username === 'string' ? b.username.trim().toLowerCase() : '';
+  const password = typeof b.password === 'string' ? b.password : '';
+  return { username, password };
+};
+function checkPassword(pw) {
+  if (pw.length < 8) throw bad('비밀번호는 8자 이상이어야 합니다');
+  if (Buffer.byteLength(pw) > 72) throw bad('비밀번호는 72바이트(영문 72자) 이하여야 합니다'); // bcrypt는 72바이트까지만 읽음
+}
+const sessionJson = (s) => ({ user: s.user, session_expires_at: isoKst(s.expires_at), session_ttl_days: SESSION_TTL_MS / 86400e3 });
+
+async function authApi(req, res, p, m, body) {
+  const me = currentSession(req);
+  if (p === '/api/auth/me' && m === 'GET') return me ? json(res, 200, sessionJson(me)) : json(res, 401, { error: '로그인이 필요합니다' });
+
+  if (p === '/api/auth/register' && m === 'POST') {
+    const { username, password } = readCreds(body);
+    if (!/^[a-z0-9_]{3,30}$/.test(username)) throw bad('아이디는 영문 소문자·숫자·밑줄 3~30자여야 합니다');
+    checkPassword(password);
+    if (authDb.prepare('SELECT 1 FROM users WHERE username = ?').get(username)) throw new HttpError(409, '이미 사용 중인 아이디입니다');
+    const hash = await bcrypt.hash(password, 10); // 솔트는 라이브러리가 계정마다 새로 만들어 해시 안에 함께 저장
+    let id, first = false;
+    try {
+      first = authDb.prepare('SELECT COUNT(*) c FROM users').get().c === 0;
+      id = Number(authDb.prepare('INSERT INTO users (username, password_hash, created_at) VALUES (?,?,?)').run(username, hash, isoKst(Date.now())).lastInsertRowid);
+    } catch { throw new HttpError(409, '이미 사용 중인 아이디입니다'); }
+    const claimed = first ? claimLegacy(id) : false;
+    const token = newSession(id);
+    return json(res, 201, { user: { id, username }, legacy_claimed: claimed }, { 'Set-Cookie': cookieHeader(req, token, SESSION_TTL_MS / 1000) });
+  }
+
+  if (p === '/api/auth/login' && m === 'POST') {
+    const { username, password } = readCreds(body);
+    const f = failures.get(username);
+    if (f && f.n >= 5 && Date.now() - f.at < 60_000) throw new HttpError(429, '로그인 시도가 너무 많습니다. 1분 뒤에 다시 시도해 주세요');
+    const u = authDb.prepare('SELECT * FROM users WHERE username = ?').get(username);
+    const ok = await bcrypt.compare(password, u ? u.password_hash : DUMMY_HASH); // 아이디가 없어도 같은 시간만큼 계산
+    if (!u || !ok) { failures.set(username, { n: (f && Date.now() - f.at < 60_000 ? f.n : 0) + 1, at: Date.now() }); throw new HttpError(401, BAD_LOGIN); }
+    failures.delete(username);
+    const token = newSession(u.id);
+    return json(res, 200, { user: { id: u.id, username: u.username } }, { 'Set-Cookie': cookieHeader(req, token, SESSION_TTL_MS / 1000) });
+  }
+
+  if (p === '/api/auth/logout' && m === 'POST') {
+    if (me) authDb.prepare('DELETE FROM sessions WHERE token_hash = ?').run(me.hash); // 서버에서 세션을 지워 이전 쿠키 값은 더 통하지 않음
+    return json(res, 200, { ok: true }, { 'Set-Cookie': cookieHeader(req, '', 0) });
+  }
+
+  if (p === '/api/auth/password' && m === 'POST') {
+    if (!me) throw new HttpError(401, '로그인이 필요합니다');
+    const u = authDb.prepare('SELECT * FROM users WHERE id = ?').get(me.user.id);
+    if (!(await bcrypt.compare(String(body.current ?? ''), u.password_hash))) throw new HttpError(401, '현재 비밀번호가 올바르지 않습니다');
+    const next = String(body.next ?? ''); checkPassword(next);
+    const hash = await bcrypt.hash(next, 10);
+    authDb.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, u.id);
+    authDb.prepare('DELETE FROM sessions WHERE user_id = ?').run(u.id); // 이전에 발급된 세션은 모두 무효화
+    return json(res, 200, { ok: true }, { 'Set-Cookie': cookieHeader(req, newSession(u.id), SESSION_TTL_MS / 1000) });
+  }
+
+  if (p === '/api/auth/delete' && m === 'POST') { // 계정 삭제: 로그인 정보·세션·내 자료 파일을 함께 지움
+    if (!me) throw new HttpError(401, '로그인이 필요합니다');
+    const u = authDb.prepare('SELECT * FROM users WHERE id = ?').get(me.user.id);
+    if (!(await bcrypt.compare(String(body.password ?? ''), u.password_hash))) throw new HttpError(401, '비밀번호가 올바르지 않습니다');
+    authDb.prepare('DELETE FROM users WHERE id = ?').run(u.id); // sessions 는 ON DELETE CASCADE
+    const h = handles.get(u.id); if (h) { h.close(); handles.delete(u.id); }
+    for (const ext of ['', '-wal', '-shm']) fs.rmSync(dbFile(u.id) + ext, { force: true });
+    return json(res, 200, { ok: true }, { 'Set-Cookie': cookieHeader(req, '', 0) });
+  }
+  throw new HttpError(404, '없는 주소입니다');
+}
+
 http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   try {

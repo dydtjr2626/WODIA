@@ -12,8 +12,83 @@ const S = { view: 'calendar', cv: 'month', day: null, gt: [], ws: null, today: n
 async function api(path, method = 'GET', body) {
   const r = await fetch('/api' + path, { method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined });
   const j = await r.json().catch(() => ({}));
+  if (r.status === 401 && !path.startsWith('/auth/')) showAuth(); // 로그인이 풀렸거나 안 한 상태 → 로그인 화면으로
   if (!r.ok) throw new Error(j.error || '요청에 실패했습니다');
   return j;
+}
+
+// ── 로그인 · 가입 화면 (로그인하기 전에는 다이어리 자료가 화면에 나오지 않는다) ──
+function showAuth(mode = 'login') {
+  const old = document.getElementById('authbg'); if (old) old.remove();
+  const reg = mode === 'register';
+  document.body.insertAdjacentHTML('beforeend', `<div id="authbg" class="authbg"><form class="authbox" id="authform" autocomplete="on">
+    <img class="logo" src="/logo.png" alt="WODIA">
+    <h2>${reg ? '회원 가입' : '로그인'}</h2>
+    <label>아이디<input name="username" autocomplete="username" required minlength="3" maxlength="30" placeholder="영문 소문자·숫자·밑줄 3~30자"></label>
+    <label>비밀번호<input name="password" type="password" autocomplete="${reg ? 'new-password' : 'current-password'}" required minlength="8" maxlength="72" placeholder="8자 이상"></label>
+    <div class="autherr" id="autherr" role="alert"></div>
+    <button class="btn primary" type="submit">${reg ? '가입하고 시작' : '로그인'}</button>
+    <button class="authlink" type="button" id="authswitch">${reg ? '로그인' : '회원가입'}</button>
+  </form></div>`);
+  $('#authswitch').onclick = () => showAuth(reg ? 'login' : 'register');
+  $('#authform').onsubmit = async (e) => {
+    e.preventDefault();
+    const f = Object.fromEntries(new FormData(e.target));
+    try { await api(reg ? '/auth/register' : '/auth/login', 'POST', f); location.reload(); }
+    catch (err) { $('#autherr').textContent = err.message; }
+  };
+  $('#authform input').focus();
+}
+// 앱 안에서 뜨는 입력 창 (브라우저의 prompt/confirm 은 일부 브라우저에서 막혀 있고, 비밀번호가 가려지지 않아 쓰지 않는다)
+function askDialog({ title, message = '', fields = [], ok = '확인', danger = false, onSubmit }) {
+  return new Promise((resolve) => {
+    const el = document.createElement('div'); el.className = 'authbg dlg';
+    el.innerHTML = `<form class="authbox" autocomplete="off">
+      <h2>${esc(title)}</h2>
+      ${message ? `<p class="dlgmsg">${esc(message)}</p>` : ''}
+      ${fields.map((f) => `<label>${esc(f.label)}<input name="${f.name}" type="password" required minlength="${f.min || 1}" maxlength="72" autocomplete="${f.name === 'current' || f.name === 'password' ? 'current-password' : 'new-password'}"></label>`).join('')}
+      ${fields.length ? '<label class="dlgshow"><input type="checkbox" id="dlgshow"> 비밀번호 보기</label>' : ''}
+      <div class="autherr" role="alert"></div>
+      <div class="dlgbtns"><button type="button" class="btn" data-x>취소</button><button type="submit" class="btn ${danger ? 'danger' : 'primary'}">${esc(ok)}</button></div>
+    </form>`;
+    document.body.append(el);
+    const form = el.querySelector('form'), err = el.querySelector('.autherr');
+    const done = (v) => { document.removeEventListener('keydown', onKey); el.remove(); resolve(v); };
+    const onKey = (e) => { if (e.key === 'Escape') done(false); };
+    document.addEventListener('keydown', onKey);
+    el.querySelector('[data-x]').onclick = () => done(false);
+    const show = el.querySelector('#dlgshow');
+    if (show) show.onchange = () => form.querySelectorAll('input[type=password],input[data-pw]').forEach((i) => { i.type = show.checked ? 'text' : 'password'; i.dataset.pw = '1'; });
+    form.onsubmit = async (e) => {
+      e.preventDefault(); err.textContent = '';
+      try { await onSubmit(Object.fromEntries(new FormData(form))); done(true); } catch (x) { err.textContent = x.message; }
+    };
+    const first = form.querySelector('input'); if (first) first.focus();
+  });
+}
+async function accountAction(kind) {
+  if (kind === 'logout') { await api('/auth/logout', 'POST', {}); return location.reload(); }
+  if (kind === 'password') {
+    const ok = await askDialog({
+      title: '비밀번호 변경', ok: '변경',
+      fields: [{ name: 'current', label: '현재 비밀번호' }, { name: 'next', label: '새 비밀번호 (8자 이상)', min: 8 }, { name: 'next2', label: '새 비밀번호 한 번 더', min: 8 }],
+      onSubmit: async (v) => {
+        if (v.next !== v.next2) throw new Error('새 비밀번호 두 칸이 서로 다릅니다');
+        await api('/auth/password', 'POST', { current: v.current, next: v.next });
+      },
+    });
+    if (ok) toast('비밀번호를 바꿨어요. 다른 기기의 로그인은 모두 풀렸어요');
+    return;
+  }
+  if (kind === 'delete') {
+    const ok = await askDialog({
+      title: '계정 삭제', ok: '계정 삭제', danger: true,
+      message: '계정을 삭제하면 내 모든 자료도 함께 지워지고 되돌릴 수 없어요. 먼저 "백업 내려받기"로 자료를 저장했는지 확인하세요. 계속하려면 비밀번호를 입력해 주세요.',
+      fields: [{ name: 'password', label: '비밀번호' }],
+      onSubmit: (v) => api('/auth/delete', 'POST', { password: v.password }),
+    });
+    if (ok) location.reload();
+  }
 }
 function toast(m, action) {
   const t = $('#toast'); t.textContent = m;
@@ -558,8 +633,14 @@ function openSettings() {
     <div class="grp">
       <div class="rowx"><span>백업 내려받기</span><a class="btn" href="/api/export?scope=all">내려받기</a></div>
       <div class="rowx"><span>백업 불러오기</span><label class="btn">불러오기<input type="file" accept=".json,application/json" id="impfile" hidden></label></div>
+    </div>
+    <div class="grp">
+      <div class="rowx"><span>계정: <b>${esc(S.meta && S.meta.user ? S.meta.user.username : '')}</b></span><button type="button" class="btn danger" data-acc="logout">로그아웃</button></div>
+      <div class="rowx"><span>비밀번호 변경</span><button type="button" class="btn" data-acc="password">변경</button></div>
+      <div class="rowx"><span>계정 삭제 (내 자료도 함께 삭제)</span><button type="button" class="btn danger" data-acc="delete">삭제</button></div>
     </div></div></div>`);
   $('#sheet').addEventListener('mousedown', (e) => { if (e.target.id === 'sheet') closeEvent(); });
+  $('#sheet').querySelectorAll('[data-acc]').forEach((b) => { b.onclick = run(() => accountAction(b.dataset.acc)); });
   renderRail();
 }
 
@@ -716,11 +797,9 @@ setInterval(run(async () => {
 }), 30000);
 
 (async () => {
-  S.meta = await api('/meta');
-  // 로그인이 없는 버전이므로 첫 화면 맨 위에 항상 안내를 보여 준다 (서버가 보낸 문구)
-  const notice = document.createElement('div'); notice.id = 'notice'; notice.textContent = S.meta.notice || '';
-  document.body.prepend(notice);
-  S.today = S.meta.today; S.day = S.today; S.ws = weekOf(S.today); S.mini = S.today;
+  const me = await fetch('/api/auth/me');
+  if (!me.ok) return showAuth(); // 로그인 전: 자료를 요청하지 않고 로그인 화면만 보여 준다
+  S.meta = await api('/meta'); S.today = S.meta.today; S.day = S.today; S.ws = weekOf(S.today); S.mini = S.today;
   await reload();
 })();
 
