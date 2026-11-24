@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: yong-wodia-7
+    name: wodia
     runtime: node
     plan: free
     buildCommand: npm install
